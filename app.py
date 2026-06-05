@@ -21,12 +21,15 @@ SKIP_DOMAINS = [
     "owler.com", "pitchbook.com", "manta.com", "bbb.org",
     "trustpilot.com", "prnewswire.com", "businesswire.com",
     "tripadvisor.com", "booking.com", "expedia.com",
-    "apple.com/app-store", "play.google.com",
+    "play.google.com",
 ]
 SUFFIXES = {"inc", "ltd", "llc", "corp", "co", "plc", "gmbh", "ag",
             "sa", "bv", "nv", "ab", "oy", "as", "limited", "company"}
 
-HEADERS = {"User-Agent": "CompanyWebsiteFinder/1.0 (research tool)"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
 
 
 def clean_name(company):
@@ -38,11 +41,50 @@ def get_root_url(url):
     return f"{p.scheme}://{p.netloc}" if p.netloc else url
 
 
+def normalize_domain(url):
+    try:
+        return urlparse(url).netloc.lower().removeprefix("www.")
+    except Exception:
+        return ""
+
+
 def is_blocked(url):
     return any(s in url for s in SKIP_DOMAINS)
 
 
-# ── Source 1: Wikidata (official website property P856) ──────────
+def domain_similarity(company, domain):
+    slug = re.sub(r"[^a-z0-9]", "", clean_name(company).lower())
+    base = domain.split(".")[0].lower()
+    return int(fuzz.ratio(slug, base) * 0.30)
+
+
+# ── Content validation: fetch page, check company name in title/meta ──
+def validate_url(company, url):
+    try:
+        r = requests.get(url, timeout=7, headers=HEADERS, allow_redirects=True)
+        if r.status_code >= 400:
+            return 0
+        html = r.text[:8000]
+        title_m = re.search(r"<title[^>]*>([^<]{1,200})</title>", html, re.IGNORECASE)
+        meta_m  = re.search(r'<meta[^>]+name=["\'](?:description|application-name)["\'][^>]+content=["\']([^"\']{1,300})["\']', html, re.IGNORECASE)
+        og_m    = re.search(r'<meta[^>]+property=["\']og:site_name["\'][^>]+content=["\']([^"\']{1,200})["\']', html, re.IGNORECASE)
+
+        title = title_m.group(1).strip() if title_m else ""
+        meta  = meta_m.group(1).strip()  if meta_m  else ""
+        og    = og_m.group(1).strip()    if og_m    else ""
+
+        query = clean_name(company)
+        return max(
+            fuzz.partial_ratio(query.lower(), title.lower()),
+            fuzz.token_set_ratio(query.lower(), title.lower()),
+            fuzz.partial_ratio(query.lower(), meta.lower()),
+            fuzz.partial_ratio(query.lower(), og.lower()),
+        )
+    except Exception:
+        return 0
+
+
+# ── Source 1: Wikidata P856 ───────────────────────────────────────
 def find_via_wikidata(company):
     try:
         search = requests.get("https://www.wikidata.org/w/api.php", headers=HEADERS, params={
@@ -52,7 +94,7 @@ def find_via_wikidata(company):
 
         for entity in search.get("search", []):
             label = entity.get("label", "")
-            if fuzz.token_set_ratio(company.lower(), label.lower()) < 65:
+            if fuzz.token_set_ratio(company.lower(), label.lower()) < 60:
                 continue
             eid = entity["id"]
             claims = requests.get("https://www.wikidata.org/w/api.php", headers=HEADERS, params={
@@ -63,15 +105,47 @@ def find_via_wikidata(company):
             if "P856" in claims:
                 url = claims["P856"][0]["mainsnak"]["datavalue"]["value"]
                 if url and not is_blocked(url):
-                    return url
+                    return get_root_url(url)
     except Exception:
         pass
     return None
 
 
-# ── Source 2: Clearbit autocomplete ──────────────────────────────
+# ── Source 2: Wikipedia infobox ───────────────────────────────────
+def find_via_wikipedia(company):
+    try:
+        search = requests.get("https://en.wikipedia.org/w/api.php", headers=HEADERS, params={
+            "action": "query", "list": "search", "srsearch": company,
+            "format": "json", "srlimit": 3
+        }, timeout=8).json()
+
+        for result in search.get("query", {}).get("search", []):
+            title = result["title"]
+            if fuzz.token_set_ratio(company.lower(), title.lower()) < 55:
+                continue
+            content = requests.get("https://en.wikipedia.org/w/api.php", headers=HEADERS, params={
+                "action": "query", "titles": title, "prop": "revisions",
+                "rvprop": "content", "rvslots": "main", "format": "json"
+            }, timeout=8).json()
+
+            for page in content.get("query", {}).get("pages", {}).values():
+                text = page.get("revisions", [{}])[0].get("slots", {}).get("main", {}).get("*", "")
+                match = re.search(r'\|\s*website\s*=\s*(?:\{\{URL\|)?([^\s|}\]\n]+)', text, re.IGNORECASE)
+                if match:
+                    url = match.group(1).strip().strip("{}")
+                    if not url.startswith("http"):
+                        url = "https://" + url
+                    url = get_root_url(url)
+                    if url and not is_blocked(url):
+                        return url
+    except Exception:
+        pass
+    return None
+
+
+# ── Source 3: Clearbit autocomplete ──────────────────────────────
 def find_via_clearbit(company):
-    queries = list(dict.fromkeys([clean_name(company), company]))  # deduplicated
+    queries = list(dict.fromkeys([clean_name(company), company]))
     first_word = clean_name(company).split()[0].lower() if clean_name(company) else ""
 
     for query in queries:
@@ -82,23 +156,21 @@ def find_via_clearbit(company):
             ).json()
             candidates = []
             for r in results:
-                name = r.get("name", "")
+                name   = r.get("name", "")
                 domain = r.get("domain", "")
                 if not domain or is_blocked(domain):
                     continue
-                dr = domain.split(".")[0].lower()
+                dr  = domain.split(".")[0].lower()
                 tld = domain.split(".")[-1].lower()
-
-                name_score = max(
+                score = max(
                     fuzz.token_set_ratio(company.lower(), name.lower()),
                     fuzz.token_sort_ratio(company.lower(), name.lower()),
                 )
-                if name_score < 65:
+                if score < 60:
                     continue
-
                 bonus = (15 if first_word and dr.startswith(first_word[:4]) else 0) + \
                         (10 if tld in ("com", "net", "org") else 0)
-                candidates.append((name_score + bonus, len(domain), domain, name))
+                candidates.append((score + bonus, len(domain), domain))
 
             candidates.sort(key=lambda x: (-x[0], x[1]))
             if candidates:
@@ -108,7 +180,7 @@ def find_via_clearbit(company):
     return None
 
 
-# ── Source 3: DuckDuckGo search (with retries) ───────────────────
+# ── Source 4: DuckDuckGo (with retries) ──────────────────────────
 def find_via_ddg(company):
     query = clean_name(company)
     search_queries = [
@@ -119,18 +191,17 @@ def find_via_ddg(company):
     for attempt in range(3):
         try:
             for q in search_queries:
-                results = DDGS().text(q, max_results=10)
-                for r in results or []:
-                    url = r.get("href", "")
+                for r in DDGS().text(q, max_results=10) or []:
+                    url   = r.get("href", "")
                     title = r.get("title", "")
-                    body = r.get("body", "")
+                    body  = r.get("body", "")
                     if not url or is_blocked(url):
                         continue
                     score = max(
                         fuzz.partial_ratio(query.lower(), title.lower()),
                         fuzz.partial_ratio(query.lower(), body.lower()),
                     )
-                    if score >= 70:
+                    if score >= 65:
                         return get_root_url(url)
             return None
         except Exception:
@@ -139,20 +210,15 @@ def find_via_ddg(company):
     return None
 
 
-# ── Source 4: Domain name guess ───────────────────────────────────
+# ── Source 5: Domain name guess ───────────────────────────────────
 def find_via_domain_guess(company):
-    query = clean_name(company)
-    slug = re.sub(r"[^a-z0-9]", "", query.lower().replace(" ", ""))
-    slug_dash = re.sub(r"[^a-z0-9-]", "-", query.lower()).strip("-")
-    slug_dash = re.sub(r"-{2,}", "-", slug_dash)
+    query    = clean_name(company)
+    slug     = re.sub(r"[^a-z0-9]", "", query.lower().replace(" ", ""))
+    slug_dash = re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9-]", "-", query.lower())).strip("-")
 
-    candidates = []
-    if slug:
-        candidates.append(f"https://{slug}.com")
-    if slug_dash and slug_dash != slug:
-        candidates.append(f"https://{slug_dash}.com")
-
-    for url in candidates:
+    for url in [f"https://{slug}.com", f"https://{slug_dash}.com"]:
+        if not slug:
+            continue
         try:
             r = requests.head(url, timeout=5, allow_redirects=True, headers=HEADERS)
             if r.status_code < 400:
@@ -162,24 +228,66 @@ def find_via_domain_guess(company):
     return None
 
 
+SOURCE_WEIGHT = {
+    "Wikidata":     50,
+    "Wikipedia":    45,
+    "Clearbit":     35,
+    "DuckDuckGo":   25,
+    "Domain guess": 15,
+}
+
+SOURCES = [
+    (find_via_wikidata,     "Wikidata"),
+    (find_via_wikipedia,    "Wikipedia"),
+    (find_via_clearbit,     "Clearbit"),
+    (find_via_ddg,          "DuckDuckGo"),
+    (find_via_domain_guess, "Domain guess"),
+]
+
+
 def find_website(company):
-    for fn, source in [
-        (find_via_wikidata, "Wikidata"),
-        (find_via_clearbit, "Clearbit"),
-        (find_via_ddg, "DuckDuckGo"),
-        (find_via_domain_guess, "Domain guess"),
-    ]:
+    # Step 1 — collect candidates from all sources
+    votes: dict[str, list] = {}   # domain -> [score, url, [sources]]
+
+    for fn, source_name in SOURCES:
         result = fn(company)
-        if result:
-            return result, source
-    return "Not found", "—"
+        if not result:
+            continue
+        domain = normalize_domain(result)
+        if not domain:
+            continue
+        sim    = domain_similarity(company, domain)
+        weight = SOURCE_WEIGHT[source_name] + sim
+        if domain in votes:
+            votes[domain][0] += weight + 20   # cross-source agreement bonus
+            votes[domain][2].append(source_name)
+        else:
+            votes[domain] = [weight, result, [source_name]]
+
+    if not votes:
+        return "Not found", "—", "low"
+
+    # Step 2 — rank candidates by vote score
+    ranked = sorted(votes.items(), key=lambda x: -x[1][0])
+
+    # Step 3 — validate top candidates by fetching their pages
+    for domain, (score, url, source_list) in ranked[:4]:
+        content_score = validate_url(company, url)
+        if content_score >= 55:
+            confidence = "high" if content_score >= 80 else "medium"
+            return url, " + ".join(source_list), confidence
+
+    # Step 4 — fall back to highest-voted even without content confirmation
+    domain, (score, url, source_list) = ranked[0]
+    return url, " + ".join(source_list), "low"
 
 
 # ── Sidebar ───────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Settings")
-    delay = st.number_input("Delay between requests (sec)", min_value=0.5, max_value=5.0, value=1.0, step=0.5)
+    delay       = st.number_input("Delay between companies (sec)", min_value=0.5, max_value=5.0, value=1.0, step=0.5)
     show_source = st.checkbox("Show source column", value=True)
+    show_conf   = st.checkbox("Show confidence column", value=True)
 
 # ── Input ─────────────────────────────────────────────────────────
 company_input = st.text_area(
@@ -193,18 +301,30 @@ if st.button("🚀 Find Websites", use_container_width=True, type="primary"):
     if not companies:
         st.warning("Please enter at least one company name.")
     else:
-        results = []
-        progress = st.progress(0, text="Starting...")
-        status = st.empty()
+        results           = []
+        progress          = st.progress(0, text="Starting...")
+        status            = st.empty()
         table_placeholder = st.empty()
 
         for i, company in enumerate(companies):
             status.markdown(f"🔎 Searching **{company}**...")
-            website, source = find_website(company)
-            results.append({"Company": company, "Website": website, "Source": source})
+            website, source, confidence = find_website(company)
+
+            conf_label = {"high": "✅ High", "medium": "🟡 Medium", "low": "🔴 Low"}.get(confidence, "—")
+            results.append({
+                "Company":    company,
+                "Website":    website,
+                "Confidence": conf_label,
+                "Source":     source,
+            })
+
             progress.progress((i + 1) / len(companies), text=f"{i+1}/{len(companies)} done")
 
-            display = results if show_source else [{"Company": r["Company"], "Website": r["Website"]} for r in results]
+            fields = ["Company", "Website"]
+            if show_conf:   fields.append("Confidence")
+            if show_source: fields.append("Source")
+            display = [{k: r[k] for k in fields} for r in results]
+
             col_cfg = {"Website": st.column_config.LinkColumn("Website", display_text="Open")}
             table_placeholder.dataframe(display, use_container_width=True, column_config=col_cfg)
 
@@ -215,7 +335,7 @@ if st.button("🚀 Find Websites", use_container_width=True, type="primary"):
         progress.empty()
 
         buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=["Company", "Website", "Source"])
+        writer = csv.DictWriter(buf, fieldnames=["Company", "Website", "Confidence", "Source"])
         writer.writeheader()
         writer.writerows(results)
         st.download_button("⬇️ Download CSV", buf.getvalue(),
