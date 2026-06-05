@@ -31,9 +31,16 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 
+EXTRA_TLDS = ["com", "net", "org", "io", "co", "ai", "app"]
+
 
 def clean_name(company):
     return " ".join(w for w in company.split() if w.lower().rstrip(".") not in SUFFIXES).strip()
+
+
+def acronym(company):
+    words = clean_name(company).split()
+    return "".join(w[0] for w in words if w).lower() if len(words) > 1 else ""
 
 
 def get_root_url(url):
@@ -58,13 +65,13 @@ def domain_similarity(company, domain):
     return int(fuzz.ratio(slug, base) * 0.30)
 
 
-# ── Content validation: fetch page, check company name in title/meta ──
+# ── Content validation ────────────────────────────────────────────
 def validate_url(company, url):
     try:
         r = requests.get(url, timeout=7, headers=HEADERS, allow_redirects=True)
         if r.status_code >= 400:
             return 0
-        html = r.text[:8000]
+        html = r.text[:10000]
         title_m = re.search(r"<title[^>]*>([^<]{1,200})</title>", html, re.IGNORECASE)
         meta_m  = re.search(r'<meta[^>]+name=["\'](?:description|application-name)["\'][^>]+content=["\']([^"\']{1,300})["\']', html, re.IGNORECASE)
         og_m    = re.search(r'<meta[^>]+property=["\']og:site_name["\'][^>]+content=["\']([^"\']{1,200})["\']', html, re.IGNORECASE)
@@ -91,7 +98,6 @@ def find_via_wikidata(company):
             "action": "wbsearchentities", "search": company,
             "language": "en", "type": "item", "format": "json", "limit": 5
         }, timeout=10).json()
-
         for entity in search.get("search", []):
             label = entity.get("label", "")
             if fuzz.token_set_ratio(company.lower(), label.lower()) < 60:
@@ -101,7 +107,6 @@ def find_via_wikidata(company):
                 "action": "wbgetentities", "ids": eid,
                 "props": "claims", "format": "json"
             }, timeout=10).json().get("entities", {}).get(eid, {}).get("claims", {})
-
             if "P856" in claims:
                 url = claims["P856"][0]["mainsnak"]["datavalue"]["value"]
                 if url and not is_blocked(url):
@@ -118,7 +123,6 @@ def find_via_wikipedia(company):
             "action": "query", "list": "search", "srsearch": company,
             "format": "json", "srlimit": 3
         }, timeout=8).json()
-
         for result in search.get("query", {}).get("search", []):
             title = result["title"]
             if fuzz.token_set_ratio(company.lower(), title.lower()) < 55:
@@ -127,7 +131,6 @@ def find_via_wikipedia(company):
                 "action": "query", "titles": title, "prop": "revisions",
                 "rvprop": "content", "rvslots": "main", "format": "json"
             }, timeout=8).json()
-
             for page in content.get("query", {}).get("pages", {}).values():
                 text = page.get("revisions", [{}])[0].get("slots", {}).get("main", {}).get("*", "")
                 match = re.search(r'\|\s*website\s*=\s*(?:\{\{URL\|)?([^\s|}\]\n]+)', text, re.IGNORECASE)
@@ -144,10 +147,10 @@ def find_via_wikipedia(company):
 
 
 # ── Source 3: Clearbit autocomplete ──────────────────────────────
-def find_via_clearbit(company):
-    queries = list(dict.fromkeys([clean_name(company), company]))
+def find_via_clearbit(company, queries=None):
+    if queries is None:
+        queries = list(dict.fromkeys([clean_name(company), company]))
     first_word = clean_name(company).split()[0].lower() if clean_name(company) else ""
-
     for query in queries:
         try:
             results = requests.get(
@@ -166,12 +169,11 @@ def find_via_clearbit(company):
                     fuzz.token_set_ratio(company.lower(), name.lower()),
                     fuzz.token_sort_ratio(company.lower(), name.lower()),
                 )
-                if score < 60:
+                if score < 55:
                     continue
                 bonus = (15 if first_word and dr.startswith(first_word[:4]) else 0) + \
                         (10 if tld in ("com", "net", "org") else 0)
                 candidates.append((score + bonus, len(domain), domain))
-
             candidates.sort(key=lambda x: (-x[0], x[1]))
             if candidates:
                 return f"https://{candidates[0][2]}"
@@ -180,14 +182,17 @@ def find_via_clearbit(company):
     return None
 
 
-# ── Source 4: DuckDuckGo (with retries) ──────────────────────────
-def find_via_ddg(company):
+# ── Source 4: DuckDuckGo ─────────────────────────────────────────
+def find_via_ddg(company, extra_queries=None):
     query = clean_name(company)
     search_queries = [
         f'"{company}" official website',
         f'{company} official site',
         f'{query} company homepage',
     ]
+    if extra_queries:
+        search_queries += extra_queries
+
     for attempt in range(3):
         try:
             for q in search_queries:
@@ -201,7 +206,7 @@ def find_via_ddg(company):
                         fuzz.partial_ratio(query.lower(), title.lower()),
                         fuzz.partial_ratio(query.lower(), body.lower()),
                     )
-                    if score >= 65:
+                    if score >= 60:
                         return get_root_url(url)
             return None
         except Exception:
@@ -210,13 +215,30 @@ def find_via_ddg(company):
     return None
 
 
-# ── Source 5: Domain name guess ───────────────────────────────────
-def find_via_domain_guess(company):
-    query    = clean_name(company)
-    slug     = re.sub(r"[^a-z0-9]", "", query.lower().replace(" ", ""))
+# ── Source 5: Domain guessing ─────────────────────────────────────
+def find_via_domain_guess(company, extended=False):
+    query     = clean_name(company)
+    slug      = re.sub(r"[^a-z0-9]", "", query.lower().replace(" ", ""))
     slug_dash = re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9-]", "-", query.lower())).strip("-")
+    acr       = acronym(company)
+    first     = query.split()[0].lower() if query else ""
 
-    for url in [f"https://{slug}.com", f"https://{slug_dash}.com"]:
+    candidates = [f"https://{slug}.com"]
+    if slug_dash != slug:
+        candidates.append(f"https://{slug_dash}.com")
+
+    if extended:
+        # extra TLDs
+        for tld in EXTRA_TLDS[1:]:
+            candidates.append(f"https://{slug}.{tld}")
+        # first word only
+        if first and first != slug:
+            candidates.append(f"https://{first}.com")
+        # acronym
+        if acr and len(acr) >= 2:
+            candidates.append(f"https://{acr}.com")
+
+    for url in candidates:
         if not slug:
             continue
         try:
@@ -236,20 +258,27 @@ SOURCE_WEIGHT = {
     "Domain guess": 15,
 }
 
-SOURCES = [
-    (find_via_wikidata,     "Wikidata"),
-    (find_via_wikipedia,    "Wikipedia"),
-    (find_via_clearbit,     "Clearbit"),
-    (find_via_ddg,          "DuckDuckGo"),
-    (find_via_domain_guess, "Domain guess"),
-]
 
+def collect_votes(company, extended=False):
+    """Run all sources and return a dict of domain -> [score, url, [sources]]."""
+    acr = acronym(company)
+    clearbit_extra = [acr, clean_name(company).split()[0]] if extended and acr else None
+    ddg_extra = [
+        f"{company} website",
+        f"{company} home",
+        f'"{clean_name(company)}" .com',
+    ] if extended else None
 
-def find_website(company):
-    # Step 1 — collect candidates from all sources
-    votes: dict[str, list] = {}   # domain -> [score, url, [sources]]
+    sources = [
+        (lambda c: find_via_wikidata(c),                   "Wikidata"),
+        (lambda c: find_via_wikipedia(c),                  "Wikipedia"),
+        (lambda c: find_via_clearbit(c, clearbit_extra),   "Clearbit"),
+        (lambda c: find_via_ddg(c, ddg_extra),             "DuckDuckGo"),
+        (lambda c: find_via_domain_guess(c, extended),     "Domain guess"),
+    ]
 
-    for fn, source_name in SOURCES:
+    votes: dict[str, list] = {}
+    for fn, source_name in sources:
         result = fn(company)
         if not result:
             continue
@@ -259,27 +288,59 @@ def find_website(company):
         sim    = domain_similarity(company, domain)
         weight = SOURCE_WEIGHT[source_name] + sim
         if domain in votes:
-            votes[domain][0] += weight + 20   # cross-source agreement bonus
+            votes[domain][0] += weight + 20
             votes[domain][2].append(source_name)
         else:
             votes[domain] = [weight, result, [source_name]]
 
-    if not votes:
-        return "Not found", "—", "low"
+    return votes
 
-    # Step 2 — rank candidates by vote score
+
+def best_validated(company, votes, threshold):
     ranked = sorted(votes.items(), key=lambda x: -x[1][0])
-
-    # Step 3 — validate top candidates by fetching their pages
-    for domain, (score, url, source_list) in ranked[:4]:
+    for domain, (score, url, source_list) in ranked[:5]:
         content_score = validate_url(company, url)
-        if content_score >= 55:
+        if content_score >= threshold:
             confidence = "high" if content_score >= 80 else "medium"
             return url, " + ".join(source_list), confidence
+    return None
 
-    # Step 4 — fall back to highest-voted even without content confirmation
-    domain, (score, url, source_list) = ranked[0]
-    return url, " + ".join(source_list), "low"
+
+def find_website(company):
+    # ── Round 1: standard sources, strict threshold ───────────────
+    votes = collect_votes(company, extended=False)
+    result = best_validated(company, votes, threshold=55)
+    if result:
+        return result
+
+    # ── Round 2: extended sources + more queries, lower threshold ─
+    votes2 = collect_votes(company, extended=True)
+    merged = {**votes}
+    for domain, (score, url, sources) in votes2.items():
+        if domain in merged:
+            merged[domain][0] += score + 20
+            for s in sources:
+                if s not in merged[domain][2]:
+                    merged[domain][2].append(s)
+        else:
+            merged[domain] = [score, url, sources]
+
+    result = best_validated(company, merged, threshold=40)
+    if result:
+        return result
+
+    # ── Round 3: accept lowest threshold, best available candidate ─
+    result = best_validated(company, merged, threshold=25)
+    if result:
+        url, src, _ = result
+        return url, src, "low"
+
+    # ── Absolute fallback ─────────────────────────────────────────
+    if merged:
+        domain, (score, url, source_list) = sorted(merged.items(), key=lambda x: -x[1][0])[0]
+        return url, " + ".join(source_list), "low"
+
+    return "Not found", "—", "low"
 
 
 # ── Sidebar ───────────────────────────────────────────────────────
