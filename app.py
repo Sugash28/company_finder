@@ -259,22 +259,28 @@ SOURCE_WEIGHT = {
 }
 
 
-def collect_votes(company, extended=False):
-    """Run all sources and return a dict of domain -> [score, url, [sources]]."""
-    acr = acronym(company)
-    clearbit_extra = [acr, clean_name(company).split()[0]] if extended and acr else None
+def collect_all_votes(company):
+    """Always run ALL sources (standard + extended) for every company."""
+    acr   = acronym(company)
+    first = clean_name(company).split()[0] if clean_name(company) else ""
+
+    clearbit_queries = list(dict.fromkeys([
+        clean_name(company), company, first, acr
+    ]))
     ddg_extra = [
         f"{company} website",
         f"{company} home",
         f'"{clean_name(company)}" .com',
-    ] if extended else None
+        f"{acr} company official site" if acr else "",
+    ]
+    ddg_extra = [q for q in ddg_extra if q]
 
     sources = [
-        (lambda c: find_via_wikidata(c),                   "Wikidata"),
-        (lambda c: find_via_wikipedia(c),                  "Wikipedia"),
-        (lambda c: find_via_clearbit(c, clearbit_extra),   "Clearbit"),
-        (lambda c: find_via_ddg(c, ddg_extra),             "DuckDuckGo"),
-        (lambda c: find_via_domain_guess(c, extended),     "Domain guess"),
+        (lambda c: find_via_wikidata(c),                         "Wikidata"),
+        (lambda c: find_via_wikipedia(c),                        "Wikipedia"),
+        (lambda c: find_via_clearbit(c, clearbit_queries),       "Clearbit"),
+        (lambda c: find_via_ddg(c, ddg_extra),                   "DuckDuckGo"),
+        (lambda c: find_via_domain_guess(c, extended=True),      "Domain guess"),
     ]
 
     votes: dict[str, list] = {}
@@ -288,7 +294,7 @@ def collect_votes(company, extended=False):
         sim    = domain_similarity(company, domain)
         weight = SOURCE_WEIGHT[source_name] + sim
         if domain in votes:
-            votes[domain][0] += weight + 20
+            votes[domain][0] += weight + 20   # cross-source agreement bonus
             votes[domain][2].append(source_name)
         else:
             votes[domain] = [weight, result, [source_name]]
@@ -296,51 +302,32 @@ def collect_votes(company, extended=False):
     return votes
 
 
-def best_validated(company, votes, threshold):
-    ranked = sorted(votes.items(), key=lambda x: -x[1][0])
-    for domain, (score, url, source_list) in ranked[:5]:
-        content_score = validate_url(company, url)
-        if content_score >= threshold:
-            confidence = "high" if content_score >= 80 else "medium"
-            return url, " + ".join(source_list), confidence
-    return None
-
-
 def find_website(company):
-    # ── Round 1: standard sources, strict threshold ───────────────
-    votes = collect_votes(company, extended=False)
-    result = best_validated(company, votes, threshold=55)
-    if result:
-        return result
+    # Always run all 5 sources for every company
+    votes = collect_all_votes(company)
 
-    # ── Round 2: extended sources + more queries, lower threshold ─
-    votes2 = collect_votes(company, extended=True)
-    merged = {**votes}
-    for domain, (score, url, sources) in votes2.items():
-        if domain in merged:
-            merged[domain][0] += score + 20
-            for s in sources:
-                if s not in merged[domain][2]:
-                    merged[domain][2].append(s)
-        else:
-            merged[domain] = [score, url, sources]
+    if not votes:
+        return "Not found", "—", "low"
 
-    result = best_validated(company, merged, threshold=40)
-    if result:
-        return result
+    # Validate every unique candidate, keep best content score
+    ranked = sorted(votes.items(), key=lambda x: -x[1][0])
+    best = {"url": None, "sources": [], "content": 0}
 
-    # ── Round 3: accept lowest threshold, best available candidate ─
-    result = best_validated(company, merged, threshold=25)
-    if result:
-        url, src, _ = result
-        return url, src, "low"
+    for domain, (vote_score, url, source_list) in ranked:
+        content_score = validate_url(company, url)
+        if content_score > best["content"]:
+            best = {"url": url, "sources": source_list, "content": content_score}
+        if content_score >= 80:
+            break   # high confidence found — no need to check further
 
-    # ── Absolute fallback ─────────────────────────────────────────
-    if merged:
-        domain, (score, url, source_list) = sorted(merged.items(), key=lambda x: -x[1][0])[0]
-        return url, " + ".join(source_list), "low"
+    if best["url"]:
+        c = best["content"]
+        confidence = "high" if c >= 80 else ("medium" if c >= 45 else "low")
+        return best["url"], " + ".join(best["sources"]), confidence
 
-    return "Not found", "—", "low"
+    # If content validation returned 0 for all (blocked JS sites etc.), return top vote winner
+    domain, (score, url, source_list) = ranked[0]
+    return url, " + ".join(source_list), "low"
 
 
 # ── Sidebar ───────────────────────────────────────────────────────
