@@ -1,3 +1,5 @@
+import ssl
+import socket
 import time
 import csv
 import io
@@ -65,6 +67,29 @@ def domain_similarity(company, domain):
     return int(fuzz.ratio(slug, base) * 0.30)
 
 
+# ── SSL certificate organisation check ───────────────────────────
+def ssl_org_score(company, domain):
+    """Return fuzzy match score between company name and SSL cert org field."""
+    try:
+        ctx  = ssl.create_default_context()
+        conn = ctx.wrap_socket(socket.socket(), server_hostname=domain)
+        conn.settimeout(5)
+        conn.connect((domain, 443))
+        cert = conn.getpeercert()
+        conn.close()
+        for field in cert.get("subject", []):
+            for key, val in field:
+                if key == "organizationName":
+                    query = clean_name(company)
+                    return max(
+                        fuzz.token_set_ratio(query.lower(), val.lower()),
+                        fuzz.partial_ratio(query.lower(), val.lower()),
+                    )
+    except Exception:
+        pass
+    return 0
+
+
 # ── Content validation ────────────────────────────────────────────
 def validate_url(company, url):
     try:
@@ -81,12 +106,20 @@ def validate_url(company, url):
         og    = og_m.group(1).strip()    if og_m    else ""
 
         query = clean_name(company)
-        return max(
+        content_score = max(
             fuzz.partial_ratio(query.lower(), title.lower()),
             fuzz.token_set_ratio(query.lower(), title.lower()),
             fuzz.partial_ratio(query.lower(), meta.lower()),
             fuzz.partial_ratio(query.lower(), og.lower()),
         )
+
+        # SSL cert check — if org name matches, boost score significantly
+        domain = normalize_domain(url)
+        cert_score = ssl_org_score(company, domain)
+        if cert_score >= 75:
+            content_score = max(content_score, 95)   # cert match = near 100% confident
+
+        return content_score
     except Exception:
         return 0
 
@@ -309,23 +342,38 @@ def find_website(company):
     if not votes:
         return "Not found", "—", "low"
 
-    # Validate every unique candidate, keep best content score
     ranked = sorted(votes.items(), key=lambda x: -x[1][0])
     best = {"url": None, "sources": [], "content": 0}
 
     for domain, (vote_score, url, source_list) in ranked:
         content_score = validate_url(company, url)
+
+        # Extra boost when multiple independent sources agree on same domain
+        source_count = len(source_list)
+        if source_count >= 3:
+            content_score = min(100, content_score + 15)
+        elif source_count == 2:
+            content_score = min(100, content_score + 8)
+
         if content_score > best["content"]:
             best = {"url": url, "sources": source_list, "content": content_score}
-        if content_score >= 80:
-            break   # high confidence found — no need to check further
+
+        if content_score >= 95:
+            break   # full confidence — SSL cert confirmed or 3+ sources agreed
 
     if best["url"]:
         c = best["content"]
-        confidence = "high" if c >= 80 else ("medium" if c >= 45 else "low")
+        if c >= 95:
+            confidence = "full"
+        elif c >= 80:
+            confidence = "high"
+        elif c >= 45:
+            confidence = "medium"
+        else:
+            confidence = "low"
         return best["url"], " + ".join(best["sources"]), confidence
 
-    # If content validation returned 0 for all (blocked JS sites etc.), return top vote winner
+    # If content validation returned 0 for all (JS-heavy sites), return top vote winner
     domain, (score, url, source_list) = ranked[0]
     return url, " + ".join(source_list), "low"
 
@@ -358,7 +406,7 @@ if st.button("🚀 Find Websites", use_container_width=True, type="primary"):
             status.markdown(f"🔎 Searching **{company}**...")
             website, source, confidence = find_website(company)
 
-            conf_label = {"high": "✅ High", "medium": "🟡 Medium", "low": "🔴 Low"}.get(confidence, "—")
+            conf_label = {"full": "💯 Full", "high": "✅ High", "medium": "🟡 Medium", "low": "🔴 Low"}.get(confidence, "—")
             results.append({
                 "Company":    company,
                 "Website":    website,
