@@ -1,5 +1,6 @@
 import ssl
 import socket
+import json
 import time
 import csv
 import io
@@ -67,9 +68,8 @@ def domain_similarity(company, domain):
     return int(fuzz.ratio(slug, base) * 0.30)
 
 
-# ── SSL certificate organisation check ───────────────────────────
+# ── SSL certificate org check ─────────────────────────────────────
 def ssl_org_score(company, domain):
-    """Return fuzzy match score between company name and SSL cert org field."""
     try:
         ctx  = ssl.create_default_context()
         conn = ctx.wrap_socket(socket.socket(), server_hostname=domain)
@@ -96,65 +96,59 @@ def validate_url(company, url):
         r = requests.get(url, timeout=7, headers=HEADERS, allow_redirects=True)
         if r.status_code >= 400:
             return 0
-        html = r.text[:10000]
+        html  = r.text[:20000]
+        query = clean_name(company)
+
+        # 1. JSON-LD structured data
+        for block in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.DOTALL | re.IGNORECASE):
+            try:
+                data  = json.loads(block.strip())
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    name = item.get("name", "") or item.get("legalName", "")
+                    if not name:
+                        continue
+                    score = max(
+                        fuzz.token_set_ratio(query.lower(), name.lower()),
+                        fuzz.partial_ratio(query.lower(), name.lower()),
+                    )
+                    if score >= 75:
+                        return 98
+            except Exception:
+                pass
+
+        # 2. SSL certificate
+        domain     = normalize_domain(url)
+        cert_score = ssl_org_score(company, domain)
+        if cert_score >= 75:
+            return 95
+
+        # 3. Title / og:site_name / meta / copyright / h1
         title_m = re.search(r"<title[^>]*>([^<]{1,200})</title>", html, re.IGNORECASE)
         meta_m  = re.search(r'<meta[^>]+name=["\'](?:description|application-name)["\'][^>]+content=["\']([^"\']{1,300})["\']', html, re.IGNORECASE)
         og_m    = re.search(r'<meta[^>]+property=["\']og:site_name["\'][^>]+content=["\']([^"\']{1,200})["\']', html, re.IGNORECASE)
+        copy_m  = re.search(r'©\s*(?:\d{4}[–\-]?\d{0,4})?\s*([^<\n]{2,80})', html)
+        h1_m    = re.search(r'<h1[^>]*>([^<]{1,150})</h1>', html, re.IGNORECASE)
 
         title = title_m.group(1).strip() if title_m else ""
         meta  = meta_m.group(1).strip()  if meta_m  else ""
         og    = og_m.group(1).strip()    if og_m    else ""
+        copy  = copy_m.group(1).strip()  if copy_m  else ""
+        h1    = h1_m.group(1).strip()    if h1_m    else ""
 
-        query = clean_name(company)
-        content_score = max(
+        return max(
             fuzz.partial_ratio(query.lower(), title.lower()),
             fuzz.token_set_ratio(query.lower(), title.lower()),
-            fuzz.partial_ratio(query.lower(), meta.lower()),
             fuzz.partial_ratio(query.lower(), og.lower()),
+            fuzz.partial_ratio(query.lower(), meta.lower()),
+            fuzz.partial_ratio(query.lower(), copy.lower()),
+            fuzz.partial_ratio(query.lower(), h1.lower()),
         )
-
-        # SSL cert check — if org name matches, boost score significantly
-        domain = normalize_domain(url)
-        cert_score = ssl_org_score(company, domain)
-        if cert_score >= 75:
-            content_score = max(content_score, 95)   # cert match = near 100% confident
-
-        return content_score
     except Exception:
         return 0
 
 
-# ── Source 1: Google Custom Search ───────────────────────────────
-def find_via_google(company, api_key, cx):
-    if not api_key or not cx:
-        return None
-    query = clean_name(company)
-    for q in [f'"{company}" official website', f'{company} official site']:
-        try:
-            data = requests.get(
-                "https://www.googleapis.com/customsearch/v1",
-                params={"q": q, "key": api_key, "cx": cx, "num": 5},
-                timeout=10
-            ).json()
-            for item in data.get("items", []):
-                url     = item.get("link", "")
-                title   = item.get("title", "")
-                snippet = item.get("snippet", "")
-                if not url or is_blocked(url):
-                    continue
-                score = max(
-                    fuzz.partial_ratio(query.lower(), title.lower()),
-                    fuzz.token_set_ratio(query.lower(), title.lower()),
-                    fuzz.partial_ratio(query.lower(), snippet.lower()),
-                )
-                if score >= 55:
-                    return get_root_url(url)
-        except Exception:
-            pass
-    return None
-
-
-# ── Source 2: Wikidata P856 ───────────────────────────────────────
+# ── Source 1: Wikidata P856 ───────────────────────────────────────
 def find_via_wikidata(company):
     try:
         search = requests.get("https://www.wikidata.org/w/api.php", headers=HEADERS, params={
@@ -209,7 +203,39 @@ def find_via_wikipedia(company):
     return None
 
 
-# ── Source 3: Clearbit autocomplete ──────────────────────────────
+# ── Source 3: DDG Instant Answers ────────────────────────────────
+def find_via_ddg_instant(company):
+    query = clean_name(company)
+    try:
+        data = requests.get(
+            "https://api.duckduckgo.com/",
+            params={"q": company, "format": "json", "no_redirect": "1", "no_html": "1"},
+            headers=HEADERS, timeout=8
+        ).json()
+
+        for item in data.get("Infobox", {}).get("content", []):
+            if item.get("label", "").lower() in ("official website", "website"):
+                url = item.get("value", "")
+                if url and not is_blocked(url):
+                    return get_root_url(url)
+
+        name = data.get("Heading", "")
+        abstract_url = data.get("AbstractURL", "")
+        if abstract_url and not is_blocked(abstract_url):
+            if fuzz.token_set_ratio(query.lower(), name.lower()) >= 55:
+                return get_root_url(abstract_url)
+
+        for rel in data.get("RelatedTopics", []):
+            url  = rel.get("FirstURL", "")
+            text = rel.get("Text", "")
+            if url and not is_blocked(url) and fuzz.partial_ratio(query.lower(), text.lower()) >= 70:
+                return get_root_url(url)
+    except Exception:
+        pass
+    return None
+
+
+# ── Source 4: Clearbit autocomplete ──────────────────────────────
 def find_via_clearbit(company, queries=None):
     if queries is None:
         queries = list(dict.fromkeys([clean_name(company), company]))
@@ -245,7 +271,7 @@ def find_via_clearbit(company, queries=None):
     return None
 
 
-# ── Source 4: DuckDuckGo ─────────────────────────────────────────
+# ── Source 5: DuckDuckGo search ──────────────────────────────────
 def find_via_ddg(company, extra_queries=None):
     query = clean_name(company)
     search_queries = [
@@ -255,7 +281,6 @@ def find_via_ddg(company, extra_queries=None):
     ]
     if extra_queries:
         search_queries += extra_queries
-
     for attempt in range(3):
         try:
             for q in search_queries:
@@ -278,32 +303,27 @@ def find_via_ddg(company, extra_queries=None):
     return None
 
 
-# ── Source 5: Domain guessing ─────────────────────────────────────
-def find_via_domain_guess(company, extended=False):
+# ── Source 6: Domain guessing ─────────────────────────────────────
+def find_via_domain_guess(company):
     query     = clean_name(company)
     slug      = re.sub(r"[^a-z0-9]", "", query.lower().replace(" ", ""))
     slug_dash = re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9-]", "-", query.lower())).strip("-")
     acr       = acronym(company)
     first     = query.split()[0].lower() if query else ""
 
-    candidates = [f"https://{slug}.com"]
-    if slug_dash != slug:
+    candidates = []
+    if slug:
+        candidates.append(f"https://{slug}.com")
+    if slug_dash and slug_dash != slug:
         candidates.append(f"https://{slug_dash}.com")
-
-    if extended:
-        # extra TLDs
-        for tld in EXTRA_TLDS[1:]:
-            candidates.append(f"https://{slug}.{tld}")
-        # first word only
-        if first and first != slug:
-            candidates.append(f"https://{first}.com")
-        # acronym
-        if acr and len(acr) >= 2:
-            candidates.append(f"https://{acr}.com")
+    for tld in EXTRA_TLDS[1:]:
+        candidates.append(f"https://{slug}.{tld}")
+    if first and first != slug:
+        candidates.append(f"https://{first}.com")
+    if acr and len(acr) >= 2:
+        candidates.append(f"https://{acr}.com")
 
     for url in candidates:
-        if not slug:
-            continue
         try:
             r = requests.head(url, timeout=5, allow_redirects=True, headers=HEADERS)
             if r.status_code < 400:
@@ -314,41 +334,37 @@ def find_via_domain_guess(company, extended=False):
 
 
 SOURCE_WEIGHT = {
-    "Google CSE":   65,
     "Wikidata":     50,
     "Wikipedia":    45,
+    "DDG Instant":  40,
     "Clearbit":     35,
     "DuckDuckGo":   25,
     "Domain guess": 15,
 }
 
 
-def collect_all_votes(company, api_key="", cx=""):
-    """Always run ALL sources (standard + extended) for every company."""
+def find_website(company):
     acr   = acronym(company)
     first = clean_name(company).split()[0] if clean_name(company) else ""
 
-    clearbit_queries = list(dict.fromkeys([
-        clean_name(company), company, first, acr
-    ]))
-    ddg_extra = [
+    clearbit_queries = list(dict.fromkeys([clean_name(company), company, first, acr]))
+    ddg_extra = [q for q in [
         f"{company} website",
         f"{company} home",
         f'"{clean_name(company)}" .com',
         f"{acr} company official site" if acr else "",
-    ]
-    ddg_extra = [q for q in ddg_extra if q]
+    ] if q]
 
     sources = [
-        (lambda c: find_via_google(c, api_key, cx),              "Google CSE"),
-        (lambda c: find_via_wikidata(c),                         "Wikidata"),
-        (lambda c: find_via_wikipedia(c),                        "Wikipedia"),
-        (lambda c: find_via_clearbit(c, clearbit_queries),       "Clearbit"),
-        (lambda c: find_via_ddg(c, ddg_extra),                   "DuckDuckGo"),
-        (lambda c: find_via_domain_guess(c, extended=True),      "Domain guess"),
+        (lambda c: find_via_wikidata(c),                   "Wikidata"),
+        (lambda c: find_via_wikipedia(c),                  "Wikipedia"),
+        (lambda c: find_via_ddg_instant(c),                "DDG Instant"),
+        (lambda c: find_via_clearbit(c, clearbit_queries), "Clearbit"),
+        (lambda c: find_via_ddg(c, ddg_extra),             "DuckDuckGo"),
+        (lambda c: find_via_domain_guess(c),               "Domain guess"),
     ]
 
-    votes: dict[str, list] = {}
+    votes: dict = {}
     for fn, source_name in sources:
         result = fn(company)
         if not result:
@@ -359,53 +375,35 @@ def collect_all_votes(company, api_key="", cx=""):
         sim    = domain_similarity(company, domain)
         weight = SOURCE_WEIGHT[source_name] + sim
         if domain in votes:
-            votes[domain][0] += weight + 20   # cross-source agreement bonus
+            votes[domain][0] += weight + 20
             votes[domain][2].append(source_name)
         else:
             votes[domain] = [weight, result, [source_name]]
-
-    return votes
-
-
-def find_website(company, api_key="", cx=""):
-    # Always run all 6 sources for every company
-    votes = collect_all_votes(company, api_key, cx)
 
     if not votes:
         return "Not found", "—", "low"
 
     ranked = sorted(votes.items(), key=lambda x: -x[1][0])
-    best = {"url": None, "sources": [], "content": 0}
+    best   = {"url": None, "sources": [], "content": 0}
 
     for domain, (vote_score, url, source_list) in ranked:
         content_score = validate_url(company, url)
-
-        # Extra boost when multiple independent sources agree on same domain
-        source_count = len(source_list)
-        if source_count >= 3:
+        if len(source_list) >= 3:
             content_score = min(100, content_score + 15)
-        elif source_count == 2:
+        elif len(source_list) == 2:
             content_score = min(100, content_score + 8)
 
         if content_score > best["content"]:
             best = {"url": url, "sources": source_list, "content": content_score}
 
         if content_score >= 95:
-            break   # full confidence — SSL cert confirmed or 3+ sources agreed
+            break
 
     if best["url"]:
         c = best["content"]
-        if c >= 95:
-            confidence = "full"
-        elif c >= 80:
-            confidence = "high"
-        elif c >= 45:
-            confidence = "medium"
-        else:
-            confidence = "low"
+        confidence = "full" if c >= 95 else ("high" if c >= 80 else ("medium" if c >= 45 else "low"))
         return best["url"], " + ".join(best["sources"]), confidence
 
-    # If content validation returned 0 for all (JS-heavy sites), return top vote winner
     domain, (score, url, source_list) = ranked[0]
     return url, " + ".join(source_list), "low"
 
@@ -413,18 +411,6 @@ def find_website(company, api_key="", cx=""):
 # ── Sidebar ───────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Settings")
-
-    st.subheader("Google Custom Search API")
-    _default_key = st.secrets.get("GOOGLE_API_KEY", "") if hasattr(st, "secrets") else ""
-    _default_cx  = st.secrets.get("GOOGLE_CX", "")      if hasattr(st, "secrets") else ""
-    google_api_key = st.text_input("API Key",  value=_default_key, type="password", placeholder="AIza...")
-    google_cx      = st.text_input("Search Engine ID (CX)", value=_default_cx, placeholder="xxxxxxxxxxxxxxx")
-    if google_api_key and google_cx:
-        st.success("Google CSE active — highest accuracy")
-    else:
-        st.info("Enter Google CSE credentials for best results")
-
-    st.divider()
     delay       = st.number_input("Delay between companies (sec)", min_value=0.5, max_value=5.0, value=1.0, step=0.5)
     show_source = st.checkbox("Show source column", value=True)
     show_conf   = st.checkbox("Show confidence column", value=True)
@@ -448,15 +434,10 @@ if st.button("🚀 Find Websites", use_container_width=True, type="primary"):
 
         for i, company in enumerate(companies):
             status.markdown(f"🔎 Searching **{company}**...")
-            website, source, confidence = find_website(company, google_api_key, google_cx)
+            website, source, confidence = find_website(company)
 
             conf_label = {"full": "💯 Full", "high": "✅ High", "medium": "🟡 Medium", "low": "🔴 Low"}.get(confidence, "—")
-            results.append({
-                "Company":    company,
-                "Website":    website,
-                "Confidence": conf_label,
-                "Source":     source,
-            })
+            results.append({"Company": company, "Website": website, "Confidence": conf_label, "Source": source})
 
             progress.progress((i + 1) / len(companies), text=f"{i+1}/{len(companies)} done")
 
@@ -464,7 +445,6 @@ if st.button("🚀 Find Websites", use_container_width=True, type="primary"):
             if show_conf:   fields.append("Confidence")
             if show_source: fields.append("Source")
             display = [{k: r[k] for k in fields} for r in results]
-
             col_cfg = {"Website": st.column_config.LinkColumn("Website", display_text="Open")}
             table_placeholder.dataframe(display, use_container_width=True, column_config=col_cfg)
 
