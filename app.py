@@ -124,7 +124,37 @@ def validate_url(company, url):
         return 0
 
 
-# ── Source 1: Wikidata P856 ───────────────────────────────────────
+# ── Source 1: Google Custom Search ───────────────────────────────
+def find_via_google(company, api_key, cx):
+    if not api_key or not cx:
+        return None
+    query = clean_name(company)
+    for q in [f'"{company}" official website', f'{company} official site']:
+        try:
+            data = requests.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={"q": q, "key": api_key, "cx": cx, "num": 5},
+                timeout=10
+            ).json()
+            for item in data.get("items", []):
+                url     = item.get("link", "")
+                title   = item.get("title", "")
+                snippet = item.get("snippet", "")
+                if not url or is_blocked(url):
+                    continue
+                score = max(
+                    fuzz.partial_ratio(query.lower(), title.lower()),
+                    fuzz.token_set_ratio(query.lower(), title.lower()),
+                    fuzz.partial_ratio(query.lower(), snippet.lower()),
+                )
+                if score >= 55:
+                    return get_root_url(url)
+        except Exception:
+            pass
+    return None
+
+
+# ── Source 2: Wikidata P856 ───────────────────────────────────────
 def find_via_wikidata(company):
     try:
         search = requests.get("https://www.wikidata.org/w/api.php", headers=HEADERS, params={
@@ -284,6 +314,7 @@ def find_via_domain_guess(company, extended=False):
 
 
 SOURCE_WEIGHT = {
+    "Google CSE":   65,
     "Wikidata":     50,
     "Wikipedia":    45,
     "Clearbit":     35,
@@ -292,7 +323,7 @@ SOURCE_WEIGHT = {
 }
 
 
-def collect_all_votes(company):
+def collect_all_votes(company, api_key="", cx=""):
     """Always run ALL sources (standard + extended) for every company."""
     acr   = acronym(company)
     first = clean_name(company).split()[0] if clean_name(company) else ""
@@ -309,6 +340,7 @@ def collect_all_votes(company):
     ddg_extra = [q for q in ddg_extra if q]
 
     sources = [
+        (lambda c: find_via_google(c, api_key, cx),              "Google CSE"),
         (lambda c: find_via_wikidata(c),                         "Wikidata"),
         (lambda c: find_via_wikipedia(c),                        "Wikipedia"),
         (lambda c: find_via_clearbit(c, clearbit_queries),       "Clearbit"),
@@ -335,9 +367,9 @@ def collect_all_votes(company):
     return votes
 
 
-def find_website(company):
-    # Always run all 5 sources for every company
-    votes = collect_all_votes(company)
+def find_website(company, api_key="", cx=""):
+    # Always run all 6 sources for every company
+    votes = collect_all_votes(company, api_key, cx)
 
     if not votes:
         return "Not found", "—", "low"
@@ -381,6 +413,18 @@ def find_website(company):
 # ── Sidebar ───────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Settings")
+
+    st.subheader("Google Custom Search API")
+    _default_key = st.secrets.get("GOOGLE_API_KEY", "") if hasattr(st, "secrets") else ""
+    _default_cx  = st.secrets.get("GOOGLE_CX", "")      if hasattr(st, "secrets") else ""
+    google_api_key = st.text_input("API Key",  value=_default_key, type="password", placeholder="AIza...")
+    google_cx      = st.text_input("Search Engine ID (CX)", value=_default_cx, placeholder="xxxxxxxxxxxxxxx")
+    if google_api_key and google_cx:
+        st.success("Google CSE active — highest accuracy")
+    else:
+        st.info("Enter Google CSE credentials for best results")
+
+    st.divider()
     delay       = st.number_input("Delay between companies (sec)", min_value=0.5, max_value=5.0, value=1.0, step=0.5)
     show_source = st.checkbox("Show source column", value=True)
     show_conf   = st.checkbox("Show confidence column", value=True)
@@ -404,7 +448,7 @@ if st.button("🚀 Find Websites", use_container_width=True, type="primary"):
 
         for i, company in enumerate(companies):
             status.markdown(f"🔎 Searching **{company}**...")
-            website, source, confidence = find_website(company)
+            website, source, confidence = find_website(company, google_api_key, google_cx)
 
             conf_label = {"full": "💯 Full", "high": "✅ High", "medium": "🟡 Medium", "low": "🔴 Low"}.get(confidence, "—")
             results.append({
