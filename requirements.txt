@@ -3,3 +3,4 @@ requests
 ddgs
 rapidfuzz
 python-dotenv
+beautifulsoup4
