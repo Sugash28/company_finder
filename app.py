@@ -8,6 +8,7 @@ import re
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from ddgs import DDGS
 from urllib.parse import urlparse, quote_plus
 from rapidfuzz import fuzz
@@ -18,22 +19,45 @@ st.markdown("Paste company names below (one per line), then click **Find Website
 
 # ── Constants ─────────────────────────────────────────────────────
 SKIP_DOMAINS = {
+    # Social media
     "linkedin.com", "facebook.com", "twitter.com", "x.com",
     "instagram.com", "youtube.com", "reddit.com",
+    # News / finance
     "bloomberg.com", "reuters.com", "forbes.com", "cnbc.com",
-    "wikipedia.org", "crunchbase.com", "glassdoor.com",
-    "indeed.com", "yelp.com", "zoominfo.com", "dnb.com",
-    "owler.com", "pitchbook.com", "manta.com", "bbb.org",
-    "trustpilot.com", "prnewswire.com", "businesswire.com",
-    "tripadvisor.com", "booking.com", "expedia.com",
-    "play.google.com", "yellowpages.com", "bizapedia.com",
-    "opencorporates.com", "companieshouse.gov.uk", "sec.gov",
+    "businessinsider.com", "techcrunch.com", "wsj.com",
+    # Business directories — the biggest source of wrong results
+    "globaldatabase.com", "kompass.com", "europages.com",
+    "yellowpages.com", "whitepages.com", "superpages.com",
+    "manta.com", "bbb.org", "bizapedia.com", "dnb.com",
+    "zoominfo.com", "owler.com", "pitchbook.com",
+    "crunchbase.com", "opencorporates.com", "infobel.com",
+    "thomasnet.com", "kellysearch.com", "hotfrog.com",
+    "companieshouse.gov.uk", "bizeurope.com", "europages.co.uk",
+    "companies.com", "businessdirectory.com", "cylex.com",
+    "brownbook.net", "bigsight.jp", "switchboard.com",
+    # Job sites
+    "glassdoor.com", "indeed.com", "monster.com", "ziprecruiter.com",
+    # Review/listing sites
+    "trustpilot.com", "tripadvisor.com", "yelp.com",
+    "booking.com", "expedia.com",
+    # PR wires
+    "prnewswire.com", "businesswire.com", "globenewswire.com",
+    # Reference
+    "wikipedia.org", "sec.gov",
+    # App stores
+    "play.google.com", "apps.apple.com",
+    # Patent / IP / research databases
+    "patsnap.com", "discovery.patsnap.com", "lens.org",
+    "patents.google.com", "espacenet.com", "orbit.com",
+    "clarivate.com", "derwent.com",
 }
 SUFFIXES = {
     "inc", "ltd", "llc", "corp", "co", "plc", "gmbh", "ag",
     "sa", "bv", "nv", "ab", "oy", "as", "limited", "company",
     "pvt", "holdings", "group", "technologies", "solutions",
     "services", "international", "global",
+    # without-dot forms of common dotted abbreviations
+    "spa", "srl", "sas", "snc", "sapa", "kk", "kft", "sro",
 }
 EXTRA_TLDS = ["com", "net", "org", "io", "co", "ai", "app"]
 
@@ -45,10 +69,18 @@ HEADERS = {
 
 EXCLUSIONS = "-linkedin -crunchbase -facebook -yelp -zoominfo -glassdoor -indeed -wikipedia"
 
+# Matches trailing dotted legal forms: S.P.A., S.r.l., N.V., B.V., etc.
+_DOTTED_SUFFIX_RE = re.compile(r'\s+([A-Za-z]\.){2,}[A-Za-z]?\.*\s*$')
+
 
 # ── Helpers ───────────────────────────────────────────────────────
 def clean_name(company: str) -> str:
-    words = company.split()
+    name = company.strip()
+    # Strip dotted legal suffixes like S.P.A. / S.r.l. / N.V. before dot removal
+    name = _DOTTED_SUFFIX_RE.sub("", name).strip()
+    name = name.replace("&", "and").replace("+", "plus")
+    name = re.sub(r"[^\w\s]", " ", name)
+    words = name.split()
     cleaned = [w for w in words if w.lower().rstrip(".,") not in SUFFIXES]
     return " ".join(cleaned).strip() or company.strip()
 
@@ -152,15 +184,17 @@ def validate_url(company: str, url: str) -> int:
         copy_m = re.search(r'©\s*(?:\d{4}[–\-]?\d{0,4})?\s*([^<\n]{2,80})', html)
         copy   = copy_m.group(1).strip() if copy_m else ""
 
-        query_clean = clean_name(company).lower()
-        signals     = [title, og, desc, h1, copy]
+        signals    = [title, og, desc, h1, copy]
+        page_text  = " ".join(signals).lower()
 
-        # Exact name present anywhere on page → high confidence
-        page_text = " ".join(signals).lower()
-        if query_clean and query_clean in page_text:
+        # Exact full name match → highest confidence
+        if company.lower() in page_text:
+            return 96
+        # Exact cleaned name match
+        if clean_name(company).lower() in page_text:
             return 92
 
-        return max(name_score(company, s) for s in signals)
+        return max((name_score(company, s) for s in signals), default=0)
     except Exception:
         return 0
 
@@ -182,47 +216,64 @@ def _parse_bing(html: str, company: str, limit: int = 5):
 
 
 def source_bing(company: str):
-    q1 = f'"{clean_name(company)}" official website {EXCLUSIONS}'
-    q2 = f'{company} official site {EXCLUSIONS}'
+    cleaned = clean_name(company)
+    queries = [
+        f'"{company}" official website {EXCLUSIONS}',
+        f'"{cleaned}" official website {EXCLUSIONS}',
+        f'{cleaned} official site {EXCLUSIONS}',
+    ]
     results = []
-    for q in [q1, q2]:
+    seen = set()
+    for q in queries:
         try:
             r = requests.get(f"https://www.bing.com/search?q={quote_plus(q)}",
                              headers=HEADERS, timeout=10)
-            results += _parse_bing(r.text, company)
+            for url, sc in _parse_bing(r.text, company):
+                d = normalize_domain(url)
+                if d not in seen:
+                    seen.add(d)
+                    results.append((url, sc))
         except Exception:
             pass
     return results
 
 
 def source_yahoo(company: str):
-    q = f'"{clean_name(company)}" official website {EXCLUSIONS}'
-    try:
-        r = requests.get(
-            f"https://search.yahoo.com/search?p={quote_plus(q)}",
-            headers=HEADERS, timeout=10
-        )
-        soup    = BeautifulSoup(r.text, "html.parser")
-        results = []
-        for a in soup.select("div.algo h3 a, div.compTitle a")[:5]:
-            href  = a.get("href", "")
-            title = a.get_text()
-            if not href or is_blocked(href) or "yahoo.com" in href:
-                continue
-            sc = name_score(company, title)
-            if sc >= 45:
-                results.append((get_root_url(href), sc))
-        return results
-    except Exception:
-        return []
+    cleaned = clean_name(company)
+    queries = [
+        f'"{company}" official website {EXCLUSIONS}',
+        f'"{cleaned}" official website {EXCLUSIONS}',
+    ]
+    seen, results = set(), []
+    for q in queries:
+        try:
+            r = requests.get(
+                f"https://search.yahoo.com/search?p={quote_plus(q)}",
+                headers=HEADERS, timeout=10
+            )
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.select("div.algo h3 a, div.compTitle a")[:5]:
+                href  = a.get("href", "")
+                title = a.get_text()
+                if not href or is_blocked(href) or "yahoo.com" in href:
+                    continue
+                sc = name_score(company, title)
+                if sc >= 45:
+                    d = normalize_domain(href)
+                    if d not in seen:
+                        seen.add(d)
+                        results.append((get_root_url(href), sc))
+        except Exception:
+            pass
+    return results
 
 
 def source_ddg(company: str):
-    query = clean_name(company)
+    cleaned = clean_name(company)
     queries = [
         f'"{company}" official website {EXCLUSIONS}',
-        f'{company} official site {EXCLUSIONS}',
-        f'{query} company homepage',
+        f'"{cleaned}" official website {EXCLUSIONS}',
+        f'{cleaned} company homepage',
     ]
     for attempt in range(3):
         try:
@@ -267,6 +318,59 @@ def source_ddg_instant(company: str):
         return results
     except Exception:
         return []
+
+
+def source_sec_edgar(company: str):
+    """SEC EDGAR — 100% accurate for US public companies."""
+    cleaned = clean_name(company)
+    try:
+        # Try full name first, then cleaned name
+        data = None
+        for search_term in [company, cleaned]:
+            resp = requests.get(
+                "https://efts.sec.gov/LATEST/search-index?q=%22" + quote_plus(search_term) + "%22&dateRange=custom&startdt=2020-01-01&forms=10-K",
+                headers=HEADERS, timeout=8
+            ).json()
+            if resp.get("hits", {}).get("hits"):
+                data = resp
+                break
+        if data is None:
+            data = {}
+        hits = data.get("hits", {}).get("hits", [])
+        if not hits:
+            # try company search endpoint
+            r2 = requests.get(
+                "https://www.sec.gov/cgi-bin/browse-edgar",
+                params={"company": company, "action": "getcompany",
+                        "type": "10-K", "dateb": "", "owner": "include",
+                        "count": "5", "search_text": "", "output": "atom"},
+                headers=HEADERS, timeout=8
+            )
+            matches = re.findall(r'<company-name>([^<]+)</company-name>.*?<website>([^<]+)</website>', r2.text, re.DOTALL)
+            for cname, url in matches:
+                if name_score(company, cname) >= 65 and url and not is_blocked(url):
+                    return [(get_root_url(url), 90)]
+            return []
+        for hit in hits[:3]:
+            src = hit.get("_source", {})
+            cname = src.get("entity_name", "")
+            if name_score(company, cname) < 60:
+                continue
+            # Get business address/website from company facts
+            cik = src.get("file_num", "").replace("0-", "").lstrip("0")
+            if cik:
+                facts = requests.get(
+                    f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json",
+                    headers=HEADERS, timeout=8
+                ).json()
+                website = facts.get("website", "") or facts.get("businessAddress", {}).get("stateOrCountry", "")
+                if website and not is_blocked(website):
+                    if not website.startswith("http"):
+                        website = "https://" + website
+                    return [(get_root_url(website), 90)]
+    except Exception:
+        pass
+    return []
 
 
 def source_gleif(company: str):
@@ -366,8 +470,10 @@ def source_wikipedia(company: str):
 
 
 def source_clearbit(company: str):
-    queries    = list(dict.fromkeys([clean_name(company), company, acronym(company)]))
-    first_word = clean_name(company).split()[0].lower() if clean_name(company) else ""
+    cleaned    = clean_name(company)
+    # Full name first for best match, then cleaned, then acronym as fallback
+    queries    = list(dict.fromkeys([company, cleaned, acronym(company)]))
+    first_word = cleaned.split()[0].lower() if cleaned else ""
     results    = []
     for query in queries:
         try:
@@ -477,6 +583,7 @@ def source_domain_guess(company: str):
 
 # ── Source registry ───────────────────────────────────────────────
 SOURCES = [
+    (source_sec_edgar,     "SEC EDGAR",   65),
     (source_gleif,         "GLEIF",       60),
     (source_wikidata,      "Wikidata",    55),
     (source_wikipedia,     "Wikipedia",   50),
@@ -492,22 +599,31 @@ SOURCES = [
 
 
 def _collect_votes(company: str, search_name: str) -> dict:
-    """Run all sources using search_name, score domains against original company."""
+    """Run all sources IN PARALLEL, score domains against original company."""
     votes: dict = {}
-    for fn, source_name, base_weight in SOURCES:
-        candidates = fn(search_name)
-        for rank, (url, match_sc) in enumerate(candidates[:5]):
-            domain = normalize_domain(url)
-            if not domain:
-                continue
-            sim        = domain_sim(company, domain)
-            rank_bonus = max(0, 10 - rank * 3)
-            weight     = base_weight + sim + rank_bonus + int(match_sc * 0.20)
-            if domain in votes:
-                votes[domain][0] += weight + 25
-                votes[domain][2].append(source_name)
-            else:
-                votes[domain] = [weight, url, [source_name]]
+
+    def run_source(fn, source_name, base_weight):
+        try:
+            return source_name, base_weight, fn(search_name)
+        except Exception:
+            return source_name, base_weight, []
+
+    with ThreadPoolExecutor(max_workers=len(SOURCES)) as ex:
+        futures = {ex.submit(run_source, fn, sn, bw): sn for fn, sn, bw in SOURCES}
+        for future in as_completed(futures):
+            source_name, base_weight, candidates = future.result()
+            for rank, (url, match_sc) in enumerate(candidates[:5]):
+                domain = normalize_domain(url)
+                if not domain:
+                    continue
+                sim        = domain_sim(company, domain)
+                rank_bonus = max(0, 10 - rank * 3)
+                weight     = base_weight + sim + rank_bonus + int(match_sc * 0.20)
+                if domain in votes:
+                    votes[domain][0] += weight + 25
+                    votes[domain][2].append(source_name)
+                else:
+                    votes[domain] = [weight, url, [source_name]]
     return votes
 
 
@@ -578,7 +694,7 @@ def find_website(company: str, status_cb=None):
     # ── Round 3: broad search, no quotes, looser queries ─────────
     say(f"🔄 **{company}** — Round 3: broad search...")
     broad_votes: dict = {}
-    for q in [f"{clean_name(company)} website", f"{company} company site"]:
+    for q in [f"{company} official website", f"{clean_name(company)} website", f"{company} company site"]:
         try:
             r = requests.get(f"https://www.bing.com/search?q={quote_plus(q)}",
                              headers=HEADERS, timeout=10)
